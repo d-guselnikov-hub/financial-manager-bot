@@ -308,10 +308,36 @@ export function currentBalances(state) {
   const funds = [...latest.values()].filter(row => row.name.startsWith('fund:') && row.minor > 0);
   const accounts = [...latest.values()].filter(row => row.name.startsWith('account:'));
   const personal = new Set(accounts.filter(row => row.name === 'account:личный остаток').map(row => row.owner?.id));
-  const known = accounts.filter(row => row.name === 'account:личный остаток' || !personal.has(row.owner?.id))
-    .reduce((sum, row) => sum + row.minor, 0);
+  const availableAccounts = accounts.filter(row => row.name === 'account:личный остаток' || !personal.has(row.owner?.id));
+  const known = availableAccounts.reduce((sum, row) => sum + row.minor, 0);
   const earmarked = funds.reduce((sum, row) => sum + row.minor, 0);
-  return { total, funds, accounts, known, earmarked, free: total ? total.minor - earmarked : undefined };
+  return { total, funds, accounts, availableAccounts, known, earmarked, free: total ? total.minor - earmarked : undefined };
+}
+
+export function personalBalancesOverview(state) {
+  const { total, free, availableAccounts, funds } = currentBalances(state);
+  const people = new Map();
+  for (const [rows, key] of [[availableAccounts, 'available'], [funds, 'saved']]) {
+    for (const { owner, minor } of rows) {
+      if (!owner?.id) continue;
+      if (!people.has(owner.id)) people.set(owner.id, { title: owner.title || 'Участник', available: null, saved: null });
+      const person = people.get(owner.id);
+      person[key] = (person[key] ?? 0) + minor;
+    }
+  }
+  if (!people.size) {
+    if (total) return `Общий остаток — ${money(total.minor, 'KZT')}. Чтобы увидеть суммы по людям, пусть каждый напишет свой свободный остаток, например «остаток 15000».`;
+    return 'Чтобы увидеть суммы по людям, пусть каждый напишет свой свободный остаток, например «остаток 15000». Можно также подтвердить скриншот со своими счетами.';
+  }
+  const lines = ['Остатки по последним записям'];
+  for (const { title, available, saved } of people.values()) {
+    const details = [];
+    if (available !== null) details.push(`свободно ${money(available, 'KZT')}`);
+    if (saved !== null) details.push(`отложено ${money(saved, 'KZT')}`);
+    lines.push(`${title} — ${details.join(' · ')}`);
+  }
+  if (total) lines.push(`\nОбщий остаток — ${money(total.minor, 'KZT')}${free >= 0 ? ` · свободно ${money(free, 'KZT')}` : ''}.`);
+  return lines.join('\n');
 }
 
 export function balancesOverview(state) {

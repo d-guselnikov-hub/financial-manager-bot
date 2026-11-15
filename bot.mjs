@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rmdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { advice, balancesOverview, budgetForExpense, budgetOverview, categoryNames, comment, findCategory, money, monthAt, parseAmount, parseBalances, parseExpense, parseIncome, savingsOverview, summarize } from './ledger.mjs';
+import { advice, balancesOverview, budgetForExpense, budgetOverview, categoryNames, comment, findCategory, money, monthAt, parseAmount, parseBalances, parseExpense, parseIncome, personalBalancesOverview, savingsOverview, summarize } from './ledger.mjs';
 import { GeminiError, makeGemini } from './gemini.mjs';
 import { downloadScreenshot, ScreenshotError, screenshotAttachment, screenshotDraft, screenshotPreview } from './screenshot.mjs';
 
@@ -34,6 +34,7 @@ const instructions = `Финансовый управляющий
 /income 350000 зарплата — записать поступление. Можно просто написать «зп 350 000 ₸».
 /savings — сколько можно отложить в этом месяце
 /funds — текущие деньги и накопления по целям
+«сколько осталось денег?» — свободные суммы и накопления по участникам
 «сейчас всего 450000» и «отложено на отпуск 150000» — обновить суммы
 Фото чека или скриншот с подписью «скрин» — распознать и проверить перед записью
 «прочитай» в ответ на старое фото или сообщение об остатке — обработать его заново
@@ -51,6 +52,8 @@ const validPeriod = period => period === 'all' || /^\d{4}-(0[1-9]|1[0-2])$/u.tes
 function commandText(text) {
   const menu = menuCommands.get(text.toLowerCase());
   if (menu) return menu;
+  const query = text.replace(/[?!.]+$/u, '').trim().replace(/\s+/gu, ' ');
+  if (/^сколько(?: у нас)? (?:осталось денег|денег осталось|денег(?: на руках)?|свободных денег)(?: (?:сейчас|у нас|у каждого))?$/iu.test(query)) return '/balance';
   const [, value] = /^бюджет\s+(.+)$/iu.exec(text) ?? [];
   if (!value) return text;
   if (value.toLowerCase() === 'подробно') return '/budget details';
@@ -244,6 +247,7 @@ export async function handleUpdate(state, config, update, bot) {
       case 'start': case 'help': return say(instructions);
       case 'menu': return say(menuText);
       case 'categories': return say(categoryNames);
+      case 'balance': return say(personalBalancesOverview(state));
       case 'funds': return say(balancesOverview(state));
       case 'savings': return say(savingsOverview(state, period, config.timezone));
       case 'total': {
