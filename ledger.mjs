@@ -61,17 +61,25 @@ export function parseIncome(text, force = false, context = '') {
 }
 
 const totalBalance = /^(?:у нас\s+)?(?:сейчас\s+(?:всего|денег)|всего(?:\s+(?:денег|на руках))?|(?:общий\s+)?баланс(?:\s+сейчас)?)(?!\p{L})\s*[:—–=]?\s*/iu;
+const personalBalance = /^(?:личный\s+)?остаток(?!\p{L})\s*[:—–=]?\s*/iu;
+const accountBalance = /^на сч[её]те\s+/iu;
 const fundBalance = /(?<!\p{L})(?:отложено|накоплено)(?!\p{L})/iu;
 
+export function normalizeBalanceAmounts(text) {
+  return text.replace(/(?<!\d)\d{1,3}(?:,\d{3})+(?!\d)/gu, value => value.replaceAll(',', ' '));
+}
+
 export function parseBalances(text) {
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
-  const hasTotal = lines.some(line => totalBalance.test(line));
+  const lines = normalizeBalanceAmounts(text).split('\n').map(line => line.trim()).filter(Boolean);
+  const hasBalance = lines.some(line => totalBalance.test(line) || personalBalance.test(line));
   const recognized = lines.map(line => {
     const total = totalBalance.exec(line);
-    if (total) return { total: true, rest: line.slice(total[0].length) };
+    if (total) return { type: 'total', rest: line.slice(total[0].length) };
+    const account = (personalBalance.exec(line) ?? accountBalance.exec(line));
+    if (account) return { type: 'account', rest: line.slice(account[0].length) };
     const fund = fundBalance.exec(line);
-    if (fund) return { total: false, rest: line.replace(fund[0], ' ') };
-    if (hasTotal && /^на\s+\p{L}/iu.test(line)) return { total: false, rest: line };
+    if (fund) return { type: 'fund', rest: line.replace(fund[0], ' ') };
+    if (hasBalance && /^на\s+\p{L}/iu.test(line)) return { type: 'fund', rest: line };
     return null;
   });
   if (!recognized.some(Boolean)) return null;
@@ -79,14 +87,15 @@ export function parseBalances(text) {
   if (/[?]/u.test(text) || recognized.some(line => !line)) return pending;
   const balances = [];
   const seen = new Set();
-  for (const { total, rest } of recognized) {
+  for (const { type, rest } of recognized) {
     const [raw, extra] = sourceAmounts(rest);
     const amount = raw && !extra && parseAmount(raw, true);
     if (!amount || amount.currency !== 'KZT') return pending;
-    if (total && /\p{L}/u.test(rest.replace(raw, '').replace(/(?:на руках|денег)/giu, ''))) return pending;
-    const title = total ? 'Всего денег' : rest.replace(raw, ' ').replace(/^[\s:—–=-]+|[\s:—–.=-]+$/gu, '').replace(/^(?:(?:из них|в том числе)\s+)?(?:на\s+)?/iu, '').replace(/\s+/gu, ' ').trim();
+    const label = rest.replace(raw, ' ').replace(/^[\s:—–=-]+|[\s:—–.=-]+$/gu, '').replace(/^(?:(?:из них|в том числе)\s+)?(?:на\s+)?/iu, '').replace(/\s+/gu, ' ').trim();
+    if (type === 'total' && /\p{L}/u.test(label.replace(/^(?:руках|денег)$/iu, ''))) return pending;
+    const title = type === 'total' ? 'Всего денег' : type === 'account' && !label ? 'Личный остаток' : label;
     if (!/\p{L}/u.test(title) || title.length > 80) return pending;
-    const name = total ? 'total' : `fund:${title.toLowerCase()}`;
+    const name = type === 'total' ? 'total' : `${type}:${title.toLowerCase()}`;
     if (seen.has(name)) return pending;
     seen.add(name);
     balances.push({ ...amount, name, title });
@@ -276,10 +285,12 @@ export function currentBalances(state) {
   const records = Object.values(state.records);
   const latest = new Map();
   for (const record of records) {
+    const owner = record.balances?.some(row => row.name === 'total') ? undefined : record.balanceOwner;
     for (const value of record.balances ?? []) {
-      const prior = latest.get(value.name);
+      const key = value.name === 'total' ? 'total' : `${owner?.id ?? ''}:${value.name}`;
+      const prior = latest.get(key);
       if (!prior || record.at > prior.at || (record.at === prior.at && record.id > prior.id)) {
-        latest.set(value.name, { ...value, at: record.at, id: record.id });
+        latest.set(key, { ...value, at: record.at, id: record.id, owner });
       }
     }
   }
@@ -294,19 +305,25 @@ export function currentBalances(state) {
     }
     total = { ...snapshot, minor };
   }
-  const funds = [...latest.values()].filter(row => row.name !== 'total' && row.minor > 0);
+  const funds = [...latest.values()].filter(row => row.name.startsWith('fund:') && row.minor > 0);
+  const accounts = [...latest.values()].filter(row => row.name.startsWith('account:'));
+  const personal = new Set(accounts.filter(row => row.name === 'account:личный остаток').map(row => row.owner?.id));
+  const known = accounts.filter(row => row.name === 'account:личный остаток' || !personal.has(row.owner?.id))
+    .reduce((sum, row) => sum + row.minor, 0);
   const earmarked = funds.reduce((sum, row) => sum + row.minor, 0);
-  return { total, funds, earmarked, free: total ? total.minor - earmarked : undefined };
+  return { total, funds, accounts, known, earmarked, free: total ? total.minor - earmarked : undefined };
 }
 
 export function balancesOverview(state) {
-  const { total, funds, earmarked, free } = currentBalances(state);
-  if (!total && !funds.length) return 'Запишите общий остаток и суммы по целям, например «сейчас всего 450000» и «отложено на отпуск 150000».';
+  const { total, funds, accounts, known, earmarked, free } = currentBalances(state);
+  if (!total && !funds.length && !accounts.length) return 'Запишите общий остаток и суммы по целям, например «сейчас всего 450000» и «отложено на отпуск 150000».';
   const lines = ['Деньги и накопления'];
   if (total) lines.push(`Всего денег — ${money(total.minor, 'KZT')}.`);
+  const list = ({ title, minor, owner }) => `• ${owner?.title ? `${owner.title} · ` : ''}${title} — ${money(minor, 'KZT')}`;
+  if (accounts.length && !total) lines.push(`Указанные свободные остатки — ${money(known, 'KZT')}.`, ...accounts.map(list));
   if (funds.length) {
     lines.push(`Отложено по целям — ${money(earmarked, 'KZT')}.`);
-    for (const { title, minor } of funds) lines.push(`• ${title} — ${money(minor, 'KZT')}`);
+    lines.push(...funds.map(list));
   }
   if (total) {
     if (free >= 0) lines.push(`Свободно — ${money(free, 'KZT')}.`);
@@ -320,12 +337,12 @@ export function savingsOverview(state, period, timezone) {
   const incomes = incomeTotals(records);
   const spend = groupByCurrency(records.flatMap(record => record.items ?? []));
   const plan = monthlyBudget(state, period, timezone);
-  const { total, funds, free } = currentBalances(state);
-  if (!incomes.size && !total && !funds.length) return 'Добавьте поступление за этот месяц, например «зп 350 000 ₸», или укажите текущий остаток: «сейчас всего 450000».';
+  const { total, funds, accounts, known, free } = currentBalances(state);
+  if (!incomes.size && !total && !funds.length && !accounts.length) return 'Добавьте поступление за этот месяц, например «зп 350 000 ₸», или укажите текущий остаток: «сейчас всего 450000».';
   const lines = [`Сколько можно отложить за ${period}`];
   const currencies = new Set(incomes.keys());
-  if (total) currencies.add('KZT');
-  if (total || funds.length) lines.push(balancesOverview(state), '');
+  if (total || accounts.length) currencies.add('KZT');
+  if (total || funds.length || accounts.length) lines.push(balancesOverview(state), '');
   for (const code of currencies) {
     const income = incomes.get(code);
     const spent = spend.get(code)?.total ?? 0;
@@ -341,11 +358,12 @@ export function savingsOverview(state, period, timezone) {
     }
     const reserved = Math.max(0, budget.minor - spent);
     const fromIncome = income === undefined ? Infinity : Math.max(0, income - spent - reserved);
-    const fromCash = code === 'KZT' && total ? Math.max(0, free - reserved) : Infinity;
+    const cash = code === 'KZT' ? (total ? free : accounts.length ? known : undefined) : undefined;
+    const fromCash = cash === undefined ? Infinity : Math.max(0, cash - reserved);
     const available = Math.min(fromIncome, fromCash);
     if (reserved) lines.push(`На оставшиеся расходы по ${budget.automatic ? 'ориентиру' : 'лимиту'} оставьте ${money(reserved, code)}.`);
     if (spent > budget.minor) lines.push('Лимит расходов уже превышен. Учтите оставшиеся платежи, если они ещё предстоят.');
-    const basis = total && code === 'KZT' ? 'с учётом свободного остатка' : 'по записанным поступлениям и расходам';
+    const basis = cash === undefined ? 'по записанным поступлениям и расходам' : total ? 'с учётом свободного остатка' : 'по указанным свободным остаткам';
     lines.push(`Можно отложить до ${money(available, code)} ${basis}.`);
     if (state.goal?.currency === code) {
       const target = Math.ceil(state.goal.minor / state.goal.months);

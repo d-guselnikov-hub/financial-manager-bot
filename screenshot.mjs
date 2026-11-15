@@ -1,11 +1,12 @@
-import { findCategory, money, parseAmount, parseBalances, sourceAmounts } from './ledger.mjs';
+import { findCategory, money, normalizeBalanceAmounts, parseAmount, parseBalances, sourceAmounts } from './ledger.mjs';
 
 const maxImageBytes = 8 * 1024 * 1024;
 const imageTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 export function screenshotAttachment(message, caption) {
   const tagged = /^(?:скрин(?:шот)?|чек|прочитай|баланс|остаток)(?=$|[\s:])/iu.test(caption);
-  if (caption && (!tagged || sourceAmounts(caption).length)) return null;
+  const heading = /^(?:скрин(?:шот)?|чек|прочитай|баланс|остаток)\s*:?$/iu.test(caption.split(/\r?\n/u)[0]);
+  if (caption && (!tagged || (!heading && sourceAmounts(caption).length))) return null;
   const photo = message.photo?.at(-1);
   if (photo) return photo;
   const file = message.document;
@@ -45,25 +46,44 @@ export async function downloadScreenshot(token, attachment, telegram, request = 
 const safeTitle = value => typeof value === 'string' && !/\d{4,}|@|https?:|\p{C}/iu.test(value)
   ? value.trim().replace(/\s+/gu, ' ').slice(0, 80) : '';
 
-export function screenshotDraft(result) {
-  if (!result || !Array.isArray(result.rows) || !result.rows.length || result.rows.length > 12) return null;
+function captionBalances(caption) {
+  const balances = [];
+  for (const line of normalizeBalanceAmounts(caption).split(/\r?\n/u).slice(1)) {
+    const [, value, account] = /^\s*(?:и\s+)?(.+?)\s+на\s+([^\d]{1,80})\s*$/iu.exec(line) ?? [];
+    const amount = value && parseAmount(value, true);
+    const title = safeTitle(account);
+    if (amount?.currency === 'KZT' && title) balances.push({ ...amount, name: `account:${title.toLowerCase()}`, title });
+  }
+  return balances;
+}
+
+export function screenshotDraft(result, caption = '') {
+  const supplemental = captionBalances(caption);
+  if (!result || !Array.isArray(result.rows) || !result.rows.length || result.rows.length > 12) {
+    return supplemental.length ? { kind: 'balances', balances: supplemental, unread: true } : null;
+  }
   if (result.kind === 'balances') {
-    const account = result.rows.length === 1 && result.rows[0]?.type === 'account';
+    const account = !supplemental.length && result.rows.length === 1 && result.rows[0]?.type === 'account';
     const lines = [];
     for (const row of result.rows) {
-      if (!row || (!['total', 'fund'].includes(row.type) && !account) || typeof row.amount !== 'string') return null;
-      if (parseAmount(row.amount.trim(), true)?.currency !== 'KZT') return null;
-      const title = safeTitle(row.title);
-      if (row.type === 'fund' && !title) return null;
-      lines.push(row.type === 'total' || account ? `сейчас всего ${row.amount}` : `отложено на ${title} ${row.amount}`);
+      if (!row || !['total', 'fund', 'account'].includes(row.type) || typeof row.amount !== 'string') return null;
+      const amount = normalizeBalanceAmounts(row.amount).trim();
+      if (parseAmount(amount, true)?.currency !== 'KZT') return null;
+      const title = safeTitle(row.title).replace(/^на\s+/iu, '');
+      if (row.type !== 'total' && !account && !title) return null;
+      if (row.type === 'total' || account) lines.push(`сейчас всего ${amount}`);
+      else if (row.type === 'fund') lines.push(`отложено на ${title} ${amount}`);
+      else lines.push(`на счёте ${title} ${amount}`);
     }
     const parsed = parseBalances(lines.join('\n'));
-    return parsed?.kind === 'balances' ? { ...parsed, account } : null;
+    if (parsed?.kind !== 'balances') return null;
+    const entries = new Map([...parsed.balances, ...supplemental].map(row => [row.name, row]));
+    return { ...parsed, balances: [...entries.values()], account };
   }
   if (!['expense', 'income'].includes(result.kind) || result.rows.length !== 1) return null;
   const [row] = result.rows;
   if (!row || row.type !== 'transaction' || typeof row.amount !== 'string') return null;
-  const amount = parseAmount(row.amount.trim().replace(result.kind === 'expense' ? /^[-−]\s*/u : /^\+\s*/u, ''));
+  const amount = parseAmount(normalizeBalanceAmounts(row.amount).trim().replace(result.kind === 'expense' ? /^[-−]\s*/u : /^\+\s*/u, ''));
   if (!amount) return null;
   const title = safeTitle(row.title) || (result.kind === 'income' ? 'Поступление' : 'Покупка');
   if (result.kind === 'income') return { kind: 'income', inflow: { ...amount, title } };
@@ -73,7 +93,9 @@ export function screenshotDraft(result) {
 export function screenshotPreview(draft) {
   if (draft.kind === 'balances') {
     if (draft.account) return `Баланс на скриншоте — ${money(draft.balances[0].minor, draft.balances[0].currency)}. Записать его как общий остаток?`;
-    return draft.balances.map(row => `${row.name === 'total' ? 'Общий остаток, включая цели' : `Отложено на ${row.title}`} — ${money(row.minor, row.currency)}`).join('\n');
+    const entries = draft.balances.map(row => `${row.name === 'total' ? 'Общий остаток, включая цели' : row.name.startsWith('account:') ? `Остаток · ${row.title}` : `Отложено на ${row.title}`} — ${money(row.minor, row.currency)}`);
+    if (draft.unread) entries.unshift('Изображение не разобрал. Из подписи:');
+    return entries.join('\n');
   }
   const row = draft.inflow ?? draft.items[0];
   const title = draft.kind === 'income' ? 'Поступление' : 'Расход';

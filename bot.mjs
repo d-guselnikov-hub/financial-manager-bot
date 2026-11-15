@@ -36,6 +36,7 @@ const instructions = `Финансовый управляющий
 /funds — текущие деньги и накопления по целям
 «сейчас всего 450000» и «отложено на отпуск 150000» — обновить суммы
 Фото чека или скриншот с подписью «скрин» — распознать и проверить перед записью
+«прочитай» в ответ на старое фото или сообщение об остатке — обработать его заново
 /goal 120000 12 — задать сумму и срок накопления в месяцах
 /review — расходы, которые ждут уточнения
 /add кофе 250 — записать расход явно
@@ -127,7 +128,7 @@ async function saveState(file, state) {
   await rename(temporary, file);
 }
 
-function put(state, key, at, parsed, text) {
+function put(state, key, at, parsed, text, balanceOwner) {
   const previous = state.records[key];
   const record = { at: previous?.at ?? at, kind: parsed.kind };
   if (parsed.kind !== 'ignore' || previous?.id) record.id = previous?.id ?? state.next++;
@@ -139,6 +140,8 @@ function put(state, key, at, parsed, text) {
   if (parsed.kind === 'expense') record.items = parsed.items;
   if (parsed.kind === 'income') record.inflow = parsed.inflow;
   if (parsed.kind === 'balances') record.balances = parsed.balances;
+  const owner = previous?.balanceOwner ?? balanceOwner;
+  if (owner && (parsed.kind === 'balances' || ['balances', 'image'].includes(parsed.flow))) record.balanceOwner = owner;
   state.records[key] = record;
   if (record.kind !== 'pending') {
     for (const [prompt, target] of Object.entries(state.prompts)) {
@@ -216,11 +219,19 @@ function review(state, after) {
 }
 
 export async function handleUpdate(state, config, update, bot) {
-  const message = update.message ?? update.edited_message;
-  if (!message || String(message.chat.id) !== config.chat || message.from?.is_bot) return;
+  const incoming = update.message ?? update.edited_message;
+  if (!incoming || String(incoming.chat.id) !== config.chat || incoming.from?.is_bot) return;
+  const quoted = incoming.reply_to_message;
+  const requestedScan = /^прочитай[.!]?$/iu.test(incoming.text?.trim() ?? '') ||
+    /^\/scan(?:@(\w+))?$/iu.test(incoming.text?.trim() ?? '') && (!incoming.text.includes('@') || incoming.text.toLowerCase().endsWith(`@${bot.username.toLowerCase()}`));
+  const quotedText = (quoted?.text ?? quoted?.caption ?? '').trim();
+  const replay = requestedScan && !update.edited_message && quoted && String(quoted.chat?.id) === config.chat && !quoted.from?.is_bot &&
+    (screenshotAttachment(quoted, quotedText) || parseBalances(quotedText));
+  const message = replay ? quoted : incoming;
   const text = (message.text ?? message.caption ?? '').trim();
   const key = `tg:${message.message_id}`;
   const at = message.date * 1_000;
+  const owner = message.from?.id ? { id: String(message.from.id), title: (message.from.first_name ?? '').replace(/\p{C}/gu, '').slice(0, 40) } : undefined;
   const command = commandText(text);
   const cmd = /^\/([a-z]+)(?:@(\w+))?(?:\s|$)/iu.exec(command);
   const say = text => ({ text });
@@ -314,14 +325,14 @@ export async function handleUpdate(state, config, update, bot) {
           const example = correctingBalances ? 'отложено на отпуск 150000' : correctingIncome ? '350000 зарплата' : 'такси 2500 ₸';
           return say(`Формат исправления — /fix ${id} ${example}.`);
         }
-        const record = put(state, target, previous.at, parsed, correction);
+        const record = put(state, target, previous.at, parsed, correction, owner);
         const reply = expenseReply(parsed, record, target);
         return { ...reply, text: `Исправил запись.\n${reply.text}` };
       }
       default: return;
     }
   }
-  const replyId = message.reply_to_message?.message_id;
+  const replyId = replay ? undefined : message.reply_to_message?.message_id;
   const referencedKey = state.prompts[replyId] ?? `tg:${replyId}`;
   const referred = state.records[referencedKey];
   if (text && !update.edited_message && (referred?.kind === 'pending' || (state.prompts[replyId] && needsCategory(referred)))) {
@@ -368,7 +379,8 @@ export async function handleUpdate(state, config, update, bot) {
     return expenseReply(parsed, record, referencedKey);
   }
   const previous = state.records[key];
-  if (previous && !update.edited_message) return;
+  if (replay && previous && !['pending', 'ignore'].includes(previous.kind)) return say(`Это сообщение уже учтено в записи #${previous.id}.`);
+  if (previous && !update.edited_message && !replay) return;
   const attachment = screenshotAttachment(message, text);
   if (attachment && update.edited_message) return;
   if (attachment) {
@@ -383,7 +395,7 @@ export async function handleUpdate(state, config, update, bot) {
     }
     if (!draft) return say('Не удалось однозначно прочитать сумму. Пришлите фрагмент с одной операцией или укажите сумму в подписи.');
     const parsed = { kind: 'pending', flow: 'image', draft };
-    const record = put(state, key, at, parsed, `Скриншот · ${screenshotPreview(draft)}`);
+    const record = put(state, key, at, parsed, `Скриншот · ${screenshotPreview(draft)}`, owner);
     return expenseReply(parsed, record, key);
   }
   if (!text) {
@@ -400,7 +412,7 @@ export async function handleUpdate(state, config, update, bot) {
   else if (previous?.kind === 'income' && parseAmount(text)) parsed = parseIncome(text, true, previous.inflow.title);
   else parsed = await classify(text, config);
   if (parsed.kind === 'ignore' && !previous) return;
-  const record = put(state, key, at, parsed, text);
+  const record = put(state, key, at, parsed, text, owner);
   if (parsed.kind === 'ignore' && ['expense', 'income', 'balances'].includes(previous.kind)) return say(`После правки запись #${record.id} исключена из итогов.`);
   return expenseReply(parsed, record, key);
 }
@@ -531,7 +543,7 @@ async function flush(state, config, tg) {
 async function run(state, config, tg) {
   if (config.gemini) config.readScreenshot = async (attachment, caption) => {
     const image = await downloadScreenshot(config.telegramToken, attachment, tg);
-    return screenshotDraft(await config.gemini.readScreenshot(image, caption));
+    return screenshotDraft(await config.gemini.readScreenshot(image, caption), caption);
   };
   const bot = await tg('getMe', {});
   if (!bot.can_read_all_group_messages) console.log('Для обычных сообщений отключите Group Privacy в BotFather и заново добавьте бота в группу, либо добавьте его как администратора.');
