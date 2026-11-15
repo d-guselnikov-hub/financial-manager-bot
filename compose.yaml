@@ -1,0 +1,25 @@
+services:
+  bot:
+    image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5
+    init: true
+    restart: unless-stopped
+    user: "${SERVICE_UID:-1000}:${SERVICE_GID:-1000}"
+    working_dir: /app
+    entrypoint: ["/bin/sh", "/app/docker-entrypoint.sh"]
+    command: ["serve"]
+    env_file: [.env]
+    environment:
+      DATA_FILE: /app/data/ledger.json
+    volumes:
+      - .:/app:ro
+      - ./data:/app/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 192m
+    pids_limit: 64
+    stop_grace_period: 110s
+    logging:
+      options:
+        max-size: 5m
+        max-file: "2"

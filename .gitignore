@@ -1,0 +1,9 @@
+.env
+.env.*
+/0. opt/
+/data/
+/result.json
+/ChatExport*/
+*.log
+*.pem
+*.key
