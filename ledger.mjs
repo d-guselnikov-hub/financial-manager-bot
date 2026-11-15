@@ -314,7 +314,9 @@ export function currentBalances(state) {
   const records = Object.values(state.records);
   const latest = new Map();
   for (const record of records) {
-    const owner = record.balances?.some(row => row.name === 'total') ? undefined : record.balanceOwner;
+    const recordedOwner = record.balances?.some(row => row.name === 'total') ? undefined : record.balanceOwner;
+    const displayName = recordedOwner && state.balanceOwnerNames?.[recordedOwner.id];
+    const owner = displayName ? { ...recordedOwner, title: displayName } : recordedOwner;
     for (const value of record.balances ?? []) {
       const key = value.name === 'total' ? 'total' : `${owner?.id ?? ''}:${value.name}`;
       const prior = latest.get(key);
