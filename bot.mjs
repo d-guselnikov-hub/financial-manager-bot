@@ -2,15 +2,17 @@ import { mkdir, readFile, rename, rmdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { advice, balancesOverview, budgetForExpense, budgetOverview, categoryNames, comment, findCategory, money, monthAt, parseAmount, parseBalances, parseExpense, parseIncome, personalBalancesOverview, savingsOverview, summarize } from './ledger.mjs';
+import { advice, balancesOverview, budgetForExpense, budgetOverview, categoryNames, comment, entriesFor, findCategory, money, monthAt, normalizeBalanceAmounts, parseAmount, parseBalances, parseExpense, parseIncome, personalBalancesOverview, savingsOverview, sourceAmounts, summarize } from './ledger.mjs';
 import { GeminiError, makeGemini } from './gemini.mjs';
 import { downloadScreenshot, ScreenshotError, screenshotAttachment, screenshotDraft, screenshotPreview } from './screenshot.mjs';
+import { periodLabel, reportPeriod } from './period.mjs';
+import { expenseChart } from './chart.mjs';
 
 const menuRows = [
   [['Этот месяц', '/total'], ['Вся история', '/total all']],
   [['Бюджет', '/budget'], ['Сколько отложить', '/savings']],
   [['Советы', '/advice'], ['Уточнить записи', '/review']],
-  [['Накопления', '/funds']],
+  [['Накопления', '/funds'], ['График', '/chart']],
 ];
 const menuCommands = new Map(menuRows.flat().map(([label, command]) => [label.toLowerCase(), command]));
 export const menuText = 'Кнопки «Финансового управляющего» под полем ввода. Траты и поступления можно писать обычными сообщениями.';
@@ -27,6 +29,8 @@ const instructions = `Финансовый управляющий
 /total — сводка за текущий месяц
 /total all — сводка за всю историю
 /total 2026-10 — сводка за выбранный месяц
+«сводка за октябрь», «сводка за 7 дней» и «сводка с 01.10 по 15.10» — выбрать период
+«график за октябрь» — получить картинку с суммами
 /advice — как сократить расходы и сколько откладывать
 /budget — общий бюджет, лимиты категорий и остатки
 /budget 60000 — задать общий месячный лимит
@@ -49,11 +53,17 @@ const instructions = `Финансовый управляющий
 const question = 'Уточните сумму и назначение. Например, «продукты 9 500 ₸». Если это не расход, используйте /skip';
 const validPeriod = period => period === 'all' || /^\d{4}-(0[1-9]|1[0-2])$/u.test(period);
 
-function commandText(text) {
+const periodHelp = 'Примеры: «сводка за октябрь», «сводка за 7 дней», «сводка с 01.10 по 15.10». Для картинки замените «сводка» на «график».';
+
+function commandText(text, now, timezone) {
   const menu = menuCommands.get(text.toLowerCase());
   if (menu) return menu;
   const query = text.replace(/[?!.]+$/u, '').trim().replace(/\s+/gu, ' ');
   if (/^сколько(?: у нас)? (?:осталось денег|денег осталось|денег(?: на руках)?|свободных денег)(?: (?:сейчас|у нас|у каждого))?$/iu.test(query)) return '/balance';
+  const [, action, requested] = /^(сводка|график|расходы|траты)(?:\s+(.+))?$/iu.exec(query) ?? [];
+  if (action && (/^(?:сводка|график)$/iu.test(action) || (requested && reportPeriod(requested, now, timezone)))) {
+    return `/${/^график$/iu.test(action) ? 'chart' : 'total'} ${requested ?? ''}`;
+  }
   const [, value] = /^бюджет\s+(.+)$/iu.exec(text) ?? [];
   if (!value) return text;
   if (value.toLowerCase() === 'подробно') return '/budget details';
@@ -95,8 +105,8 @@ function api(token, request = fetch) {
     let body;
     try {
       response = await request(`https://api.telegram.org/bot${token}/${method}`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload), signal: AbortSignal.timeout(timeout),
+        method: 'POST', headers: payload instanceof FormData ? undefined : { 'content-type': 'application/json' },
+        body: payload instanceof FormData ? payload : JSON.stringify(payload), signal: AbortSignal.timeout(timeout),
       });
       body = await response.json();
     } catch {
@@ -144,7 +154,7 @@ function put(state, key, at, parsed, text, balanceOwner) {
   if (parsed.kind === 'income') record.inflow = parsed.inflow;
   if (parsed.kind === 'balances') record.balances = parsed.balances;
   const owner = previous?.balanceOwner ?? balanceOwner;
-  if (owner && (parsed.kind === 'balances' || ['balances', 'image'].includes(parsed.flow))) record.balanceOwner = owner;
+  if (owner && (parsed.kind === 'balances' || ['balances', 'image', 'money-intent'].includes(parsed.flow))) record.balanceOwner = owner;
   state.records[key] = record;
   if (record.kind !== 'pending') {
     for (const [prompt, target] of Object.entries(state.prompts)) {
@@ -160,7 +170,15 @@ function amountOnly(text) {
 }
 
 function localEntry(text) {
-  return parseBalances(text) ?? parseIncome(text) ?? amountOnly(text);
+  const known = parseBalances(text) ?? parseIncome(text) ?? amountOnly(text);
+  if (known) return known;
+  const normalized = normalizeBalanceAmounts(text);
+  const [raw, extra] = sourceAmounts(normalized);
+  if (raw && !extra && /карманны[ех] расход|кас(?:пи|ппи)/iu.test(normalized) &&
+    !/купил|потратил|оплатил|заплатил|списал|снял|перев[её]л|зачислил/iu.test(normalized)) {
+    return { kind: 'pending', flow: 'money-intent' };
+  }
+  return null;
 }
 
 function classifyLocally(text, clarification) {
@@ -205,7 +223,8 @@ function responseFor(parsed, record, key, state, period, timezone) {
   }
   if (parsed.kind === 'pending' && !parsed.quiet) {
     if (parsed.flow === 'image') return { text: `${screenshotPreview(parsed.draft)}\n\nОтветьте «да», чтобы записать, или «нет», чтобы отменить.\n#${record.id}`, prompt: key };
-    if (parsed.flow === 'balances') return { text: `Укажите одну сумму на строку. Например, «сейчас всего 450000» или «отложено на отпуск 150000».\n#${record.id}`, prompt: key };
+    if (parsed.flow === 'money-intent') return { text: `Это остаток, трата или поступление? Ответьте «остаток», «трата» или «поступление».\n#${record.id}`, prompt: key };
+    if (parsed.flow === 'balances') return { text: `Уточните сумму и где лежат деньги. Например, «у меня есть 10000 на карманные расходы» или «отложено на отпуск 150000».\n#${record.id}`, prompt: key };
     if (parsed.flow === 'income') return { text: `Сколько поступило? Ответьте, например, «350 000 ₸ зарплата».\n#${record.id}`, prompt: key };
     return { text: `${parsed.note || `${question} ${record.id}.`}\n#${record.id}`, prompt: key };
   }
@@ -235,10 +254,11 @@ export async function handleUpdate(state, config, update, bot) {
   const key = `tg:${message.message_id}`;
   const at = message.date * 1_000;
   const owner = message.from?.id ? { id: String(message.from.id), title: (message.from.first_name ?? '').replace(/\p{C}/gu, '').slice(0, 40) } : undefined;
-  const command = commandText(text);
+  const now = Date.now();
+  const command = commandText(text, now, config.timezone);
   const cmd = /^\/([a-z]+)(?:@(\w+))?(?:\s|$)/iu.exec(command);
   const say = text => ({ text });
-  const period = monthAt(Date.now(), config.timezone);
+  const period = monthAt(now, config.timezone);
   const expenseReply = (parsed, record, target) => responseFor(parsed, record, target, state, period, config.timezone);
   if (cmd) {
     if (update.edited_message || (cmd[2] && cmd[2].toLowerCase() !== bot.username.toLowerCase())) return;
@@ -251,9 +271,15 @@ export async function handleUpdate(state, config, update, bot) {
       case 'funds': return say(balancesOverview(state));
       case 'savings': return say(savingsOverview(state, period, config.timezone));
       case 'total': {
-        const selected = argument.toLowerCase() || period;
-        if (!validPeriod(selected)) return say('Используйте /total, /total all или /total 2026-10.');
+        const selected = reportPeriod(argument, now, config.timezone);
+        if (!selected) return say(periodHelp);
         return say(summarize(state, selected, config.timezone));
+      }
+      case 'chart': {
+        const selected = reportPeriod(argument, now, config.timezone);
+        if (!selected) return say(periodHelp);
+        if (!entriesFor(state, selected, config.timezone).some(record => record.items?.length)) return say(`Расходы ${periodLabel(selected)} пока не записаны.`);
+        return { text: `График расходов ${periodLabel(selected)}.`, chart: selected };
       }
       case 'advice': {
         const selected = argument.toLowerCase() || period;
@@ -364,6 +390,16 @@ export async function handleUpdate(state, config, update, bot) {
         if (!parsed || !['expense', 'income', 'balances'].includes(parsed.kind)) {
           return { text: 'Ответьте «да» или «нет». Для исправления можно ввести запись целиком, например «такси 2500» или «сейчас всего 450000».', prompt: referencedKey };
         }
+      }
+    } else if (referred.flow === 'money-intent') {
+      const original = normalizeBalanceAmounts(referred.text);
+      const intent = text.toLowerCase().replace(/[.!]+$/u, '').trim();
+      if (/^(?:остаток|деньги на руках)$/u.test(intent)) parsed = parseBalances(`на счёте ${original}`);
+      else if (/^(?:трата|расход)$/u.test(intent)) parsed = parseExpense(original, true);
+      else if (/^(?:поступление|доход)$/u.test(intent)) parsed = parseIncome(original, true);
+      else parsed = parseBalances(text) ?? parseIncome(text) ?? parseExpense(text, true);
+      if (!parsed || !['expense', 'income', 'balances'].includes(parsed.kind)) {
+        return { text: 'Уточните, пожалуйста: «остаток», «трата» или «поступление»?', prompt: referencedKey };
       }
     } else if (referred.flow === 'balances') {
       const completed = parseAmount(text, true) ? parseBalances(`${referred.text} ${text}`) : null;
@@ -526,12 +562,39 @@ async function enroll(config, tg) {
 
 async function flush(state, config, tg) {
   if (!state.outbox) return;
-  const { text, prompt, messageId, thread } = state.outbox;
+  const { chart, prompt, messageId, thread } = state.outbox;
+  let { text } = state.outbox;
+  const replyParameters = { message_id: messageId, allow_sending_without_reply: true };
   try {
-    const sent = await tg('sendMessage', {
+    let sent;
+    if (chart) {
+      let png;
+      try {
+        png = await expenseChart(state, chart, config.timezone);
+      } catch {
+        console.error('Рендерер графика недоступен. Отправляю текстовую сводку.');
+      }
+      if (png) {
+        const form = new FormData();
+        form.append('chat_id', config.chat);
+        if (thread) form.append('message_thread_id', String(thread));
+        form.append('caption', text);
+        form.append('reply_parameters', JSON.stringify(replyParameters));
+        form.append('reply_markup', JSON.stringify(menuKeyboard));
+        form.append('photo', new Blob([png], { type: 'image/png' }), 'expenses.png');
+        try {
+          sent = await tg('sendPhoto', form, 35_000);
+        } catch (error) {
+          if (error.status !== 400) throw error;
+          console.error(error.message);
+        }
+      }
+      if (!sent) text = summarize(state, chart, config.timezone);
+    }
+    sent ??= await tg('sendMessage', {
       chat_id: config.chat, message_thread_id: thread,
       text: text.length > 3900 ? `${text.slice(0, 3890)}…` : text,
-      reply_parameters: { message_id: messageId, allow_sending_without_reply: true },
+      reply_parameters: replyParameters,
       reply_markup: prompt ? { force_reply: true, selective: true } : menuKeyboard,
       link_preview_options: { is_disabled: true },
     });

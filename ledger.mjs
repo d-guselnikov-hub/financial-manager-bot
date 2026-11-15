@@ -63,6 +63,7 @@ export function parseIncome(text, force = false, context = '') {
 const totalBalance = /^(?:у нас\s+)?(?:сейчас\s+(?:всего|денег)|всего(?:\s+(?:денег|на руках))?|(?:общий\s+)?баланс(?:\s+сейчас)?)(?!\p{L})\s*[:—–=]?\s*/iu;
 const personalBalance = /^(?:личный\s+)?остаток(?!\p{L})\s*[:—–=]?\s*/iu;
 const accountBalance = /^на сч[её]те\s+/iu;
+const ownedBalance = /^у меня\s+(?:(ещ[её])\s+)?(?:есть|осталось|имеется)(?!\p{L})\s*[:—–=]?\s*/iu;
 const fundBalance = /(?<!\p{L})(?:отложено|накоплено)(?!\p{L})/iu;
 
 export function normalizeBalanceAmounts(text) {
@@ -71,12 +72,16 @@ export function normalizeBalanceAmounts(text) {
 
 export function parseBalances(text) {
   const lines = normalizeBalanceAmounts(text).split('\n').map(line => line.trim()).filter(Boolean);
-  const hasBalance = lines.some(line => totalBalance.test(line) || personalBalance.test(line));
+  const hasBalance = lines.some(line => totalBalance.test(line) || personalBalance.test(line) || ownedBalance.test(line));
   const recognized = lines.map(line => {
     const total = totalBalance.exec(line);
     if (total) return { type: 'total', rest: line.slice(total[0].length) };
     const account = (personalBalance.exec(line) ?? accountBalance.exec(line));
     if (account) return { type: 'account', rest: line.slice(account[0].length) };
+    const owned = ownedBalance.exec(line);
+    if (owned && (sourceAmounts(line).length || /(?:деньг|карманн|остаток|наличн|карт[аеу]|кас[пп]и)/iu.test(line.slice(owned[0].length)))) {
+      return { type: 'account', rest: line.slice(owned[0].length), additional: Boolean(owned[1]) };
+    }
     const fund = fundBalance.exec(line);
     if (fund) return { type: 'fund', rest: line.replace(fund[0], ' ') };
     if (hasBalance && /^на\s+\p{L}/iu.test(line)) return { type: 'fund', rest: line };
@@ -87,18 +92,18 @@ export function parseBalances(text) {
   if (/[?]/u.test(text) || recognized.some(line => !line)) return pending;
   const balances = [];
   const seen = new Set();
-  for (const { type, rest } of recognized) {
+  for (const { type, rest, additional } of recognized) {
     const [raw, extra] = sourceAmounts(rest);
     const amount = raw && !extra && parseAmount(raw, true);
     if (!amount || amount.currency !== 'KZT') return pending;
     const label = rest.replace(raw, ' ').replace(/^[\s:—–=-]+|[\s:—–.=-]+$/gu, '').replace(/^(?:(?:из них|в том числе)\s+)?(?:на\s+)?/iu, '').replace(/\s+/gu, ' ').trim();
     if (type === 'total' && /\p{L}/u.test(label.replace(/^(?:руках|денег)$/iu, ''))) return pending;
-    const title = type === 'total' ? 'Всего денег' : type === 'account' && !label ? 'Личный остаток' : label;
+    const title = type === 'total' ? 'Всего денег' : type === 'account' && !label ? (additional ? 'Дополнительный остаток' : 'Личный остаток') : label;
     if (!/\p{L}/u.test(title) || title.length > 80) return pending;
     const name = type === 'total' ? 'total' : `${type}:${title.toLowerCase()}`;
     if (seen.has(name)) return pending;
     seen.add(name);
-    balances.push({ ...amount, name, title });
+    balances.push({ ...amount, name, title, ...(additional ? { additional: true } : {}) });
   }
   return { kind: 'balances', balances };
 }
@@ -155,6 +160,12 @@ export function monthAt(timestamp, timezone) {
   return `${parts.find(part => part.type === 'year').value}-${parts.find(part => part.type === 'month').value}`;
 }
 
+const dayFormats = new Map();
+export function dayAt(timestamp, timezone) {
+  if (!dayFormats.has(timezone)) dayFormats.set(timezone, new Intl.DateTimeFormat('sv-SE', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }));
+  return dayFormats.get(timezone).format(timestamp);
+}
+
 function groupByCurrency(items) {
   const groups = new Map();
   for (const item of items) {
@@ -168,7 +179,13 @@ function groupByCurrency(items) {
 }
 
 export function entriesFor(state, period, timezone) {
-  return Object.values(state.records).filter(record => period === 'all' || monthAt(record.at, timezone) === period);
+  const records = Object.values(state.records);
+  if (period === 'all') return records;
+  if (typeof period === 'string') return records.filter(record => monthAt(record.at, timezone) === period);
+  return records.filter(record => {
+    const day = dayAt(record.at, timezone);
+    return day >= period.from && day <= period.to;
+  });
 }
 
 export function findCategory(value) {
@@ -307,8 +324,11 @@ export function currentBalances(state) {
   }
   const funds = [...latest.values()].filter(row => row.name.startsWith('fund:') && row.minor > 0);
   const accounts = [...latest.values()].filter(row => row.name.startsWith('account:'));
-  const personal = new Set(accounts.filter(row => row.name === 'account:личный остаток').map(row => row.owner?.id));
-  const availableAccounts = accounts.filter(row => row.name === 'account:личный остаток' || !personal.has(row.owner?.id));
+  const personal = new Map(accounts.filter(row => row.name === 'account:личный остаток').map(row => [row.owner?.id, row]));
+  const availableAccounts = accounts.filter(row => {
+    const snapshot = personal.get(row.owner?.id);
+    return !snapshot || row === snapshot || (row.additional && (row.at > snapshot.at || (row.at === snapshot.at && row.id >= snapshot.id)));
+  });
   const known = availableAccounts.reduce((sum, row) => sum + row.minor, 0);
   const earmarked = funds.reduce((sum, row) => sum + row.minor, 0);
   return { total, funds, accounts, availableAccounts, known, earmarked, free: total ? total.minor - earmarked : undefined };
@@ -403,7 +423,7 @@ export function savingsOverview(state, period, timezone) {
 export function summarize(state, period, timezone) {
   const records = entriesFor(state, period, timezone);
   const grouped = groupByCurrency(records.flatMap(record => record.items ?? []));
-  const lines = [period === 'all' ? 'Расходы за всю историю' : `Расходы за ${period}`];
+  const lines = [period === 'all' ? 'Расходы за всю историю' : typeof period === 'string' ? `Расходы за ${period}` : `Расходы ${period.label}`];
   if (!grouped.size) lines.push('Подтверждённых расходов пока нет.');
   for (const [code, group] of grouped) {
     lines.push('', `Итого ${money(group.total, code)} · записей ${group.count}`);
