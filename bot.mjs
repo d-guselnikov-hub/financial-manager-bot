@@ -39,6 +39,7 @@ const instructions = `Финансовый управляющий
 /savings — сколько можно отложить в этом месяце
 /funds — текущие деньги и накопления по целям
 «сколько осталось денег?» — свободные суммы и накопления по участникам
+«сколько у нас осталось денег? какой бюджет и на что?» — оба отчёта одним ответом
 «сейчас всего 450000» и «отложено на отпуск 150000» — обновить суммы
 Фото чека или скриншот с подписью «скрин» — распознать и проверить перед записью
 «прочитай» в ответ на старое фото или сообщение об остатке — обработать его заново
@@ -55,11 +56,25 @@ const validPeriod = period => period === 'all' || /^\d{4}-(0[1-9]|1[0-2])$/u.tes
 
 const periodHelp = 'Примеры: «сводка за октябрь», «сводка за 7 дней», «сводка с 01.10 по 15.10». Для картинки замените «сводка» на «график».';
 
+function naturalQuestions(text) {
+  const clauses = text.trim().toLowerCase()
+    .split(/[?!;\n]+|,\s*(?=сколько|какой|что по)|,?\s+(?:и|а)\s+(?=сколько|какой|что по)/u)
+    .map(clause => clause.trim().replace(/^(?:а |и )/u, '').replace(/[.,]+$/u, '').replace(/\s+/gu, ' '))
+    .filter(Boolean);
+  const topics = [];
+  for (const clause of clauses) {
+    if (/^сколько(?: (?:у нас|у меня|у каждого))? (?:осталось денег|денег осталось|денег(?: на руках)?|свободных денег)(?: (?:сейчас|у нас|у каждого))?$/u.test(clause)) topics.push('balance');
+    else if (/^(?:какой(?: (?:у нас|сейчас))? бюджет(?: (?:на месяц|сейчас|у нас))?(?: и на что)?|что по бюджету|на что (?:хватит|можем потратить)(?: денег)?|сколько (?:мы )?(?:можем|можно) потратить(?: и на что)?|сколько осталось (?:по бюджету|на (?:траты|расходы)))$/u.test(clause)) topics.push('budget');
+    else if (/^сколько (?:мы )?(?:можем|можно) отложить(?: в этом месяце)?$/u.test(clause)) topics.push('savings');
+    else return null;
+  }
+  return topics.length ? [...new Set(topics)] : null;
+}
+
 function commandText(text, now, timezone) {
   const menu = menuCommands.get(text.toLowerCase());
   if (menu) return menu;
   const query = text.replace(/[?!.]+$/u, '').trim().replace(/\s+/gu, ' ');
-  if (/^сколько(?: у нас)? (?:осталось денег|денег осталось|денег(?: на руках)?|свободных денег)(?: (?:сейчас|у нас|у каждого))?$/iu.test(query)) return '/balance';
   const [, action, requested] = /^(сводка|график|расходы|траты)(?:\s+(.+))?$/iu.exec(query) ?? [];
   if (action && (/^(?:сводка|график)$/iu.test(action) || (requested && reportPeriod(requested, now, timezone)))) {
     return `/${/^график$/iu.test(action) ? 'chart' : 'total'} ${requested ?? ''}`;
@@ -248,7 +263,7 @@ export async function handleUpdate(state, config, update, bot) {
     /^\/scan(?:@(\w+))?$/iu.test(incoming.text?.trim() ?? '') && (!incoming.text.includes('@') || incoming.text.toLowerCase().endsWith(`@${bot.username.toLowerCase()}`));
   const quotedText = (quoted?.text ?? quoted?.caption ?? '').trim();
   const replay = requestedScan && !update.edited_message && quoted && String(quoted.chat?.id) === config.chat && !quoted.from?.is_bot &&
-    (screenshotAttachment(quoted, quotedText) || parseBalances(quotedText));
+    (screenshotAttachment(quoted, quotedText) || parseBalances(quotedText) || naturalQuestions(quotedText));
   const message = replay ? quoted : incoming;
   const text = (message.text ?? message.caption ?? '').trim();
   const key = `tg:${message.message_id}`;
@@ -260,6 +275,16 @@ export async function handleUpdate(state, config, update, bot) {
   const say = text => ({ text });
   const period = monthAt(now, config.timezone);
   const expenseReply = (parsed, record, target) => responseFor(parsed, record, target, state, period, config.timezone);
+  const topics = naturalQuestions(text);
+  if (topics) {
+    if (update.edited_message) return;
+    const sections = topics.map(topic => {
+      if (topic === 'balance') return personalBalancesOverview(state);
+      if (topic === 'budget') return budgetOverview(state, period, config.timezone, false, true);
+      return savingsOverview(state, period, config.timezone, !topics.includes('balance'));
+    });
+    return say(sections.join('\n\n'));
+  }
   if (cmd) {
     if (update.edited_message || (cmd[2] && cmd[2].toLowerCase() !== bot.username.toLowerCase())) return;
     const argument = command.slice(cmd[0].length).trim();

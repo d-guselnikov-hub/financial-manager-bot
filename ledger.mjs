@@ -261,16 +261,28 @@ function categoryBudgetLine(row, totals, detailed) {
 
 const compactCategories = ['Кафе и доставка', 'Продукты', 'Транспорт'];
 
-export function budgetOverview(state, period, timezone, detailed = false) {
+export function budgetOverview(state, period, timezone, detailed = false, capByCash = false) {
   const plan = monthlyBudget(state, period, timezone);
   const sorted = plan.categories.sort((a, b) => b.minor - a.minor);
   if (!plan.totals.length && !sorted.length) return 'Пока нет лимитов и данных за завершённый месяц. Можно задать общий лимит сообщением «бюджет 60000».';
   const preferred = compactCategories.flatMap(name => sorted.filter(row => row.category === name));
   const visible = detailed ? sorted : [...preferred, ...sorted.filter(row => !compactCategories.includes(row.category))].slice(0, 3);
+  let categoryCaps = plan.totals;
+  let cashLimit;
+  if (capByCash) {
+    const { total, accounts, known, free } = currentBalances(state);
+    const cash = total ? free : accounts.length ? known : undefined;
+    const budget = plan.totals.find(row => row.currency === 'KZT');
+    if (cash !== undefined && budget && cash < Math.max(0, budget.minor - budget.spent)) {
+      cashLimit = Math.max(0, cash);
+      categoryCaps = plan.totals.map(row => row === budget ? { ...row, minor: row.spent + cashLimit } : row);
+    }
+  }
   const lines = [
     `Бюджет на ${period}`,
     ...plan.totals.map(budgetLine),
-    ...visible.map(row => categoryBudgetLine(row, plan.totals, detailed)),
+    ...(cashLimit === undefined ? [] : [`По указанным деньгам на траты — до ${money(cashLimit, 'KZT')}.`]),
+    ...visible.map(row => categoryBudgetLine(row, categoryCaps, detailed)),
   ];
   if (visible.some(row => plan.totals.some(total => total.currency === row.currency))) {
     lines.push('', 'Любая трата уменьшает общий остаток.');
@@ -378,7 +390,7 @@ export function balancesOverview(state) {
   return lines.join('\n');
 }
 
-export function savingsOverview(state, period, timezone) {
+export function savingsOverview(state, period, timezone, showBalances = true) {
   const records = entriesFor(state, period, timezone);
   const incomes = incomeTotals(records);
   const spend = groupByCurrency(records.flatMap(record => record.items ?? []));
@@ -388,7 +400,7 @@ export function savingsOverview(state, period, timezone) {
   const lines = [`Сколько можно отложить за ${period}`];
   const currencies = new Set(incomes.keys());
   if (total || accounts.length) currencies.add('KZT');
-  if (total || funds.length || accounts.length) lines.push(balancesOverview(state), '');
+  if (showBalances && (total || funds.length || accounts.length)) lines.push(balancesOverview(state), '');
   for (const code of currencies) {
     const income = incomes.get(code);
     const spent = spend.get(code)?.total ?? 0;
