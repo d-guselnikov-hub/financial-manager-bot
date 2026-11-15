@@ -28,14 +28,14 @@ function currency(mark) {
   return currencyCodes.get(mark) ?? (/^(KZT|USD|EUR)$/i.test(mark) ? mark.toUpperCase() : 'RUB');
 }
 
-export function parseAmount(value) {
+export function parseAmount(value, allowZero = false) {
   const [match, second] = value.matchAll(moneyPattern);
   if (!match || second || match[0] !== value) return null;
   const [, prefix, digits, thousands, suffix] = match;
   const suffixCurrency = currency(suffix);
   if (prefix && suffixCurrency && currency(prefix) !== suffixCurrency) return null;
   const minor = Math.round(Number(digits.replace(/[ \u00a0\u202f]/gu, '').replace(',', '.')) * (thousands ? 100_000 : 100));
-  if (!Number.isSafeInteger(minor) || minor <= 0 || minor > amountLimit) return null;
+  if (!Number.isSafeInteger(minor) || minor < 0 || (!allowZero && minor === 0) || minor > amountLimit) return null;
   return { minor, currency: currency(prefix) ?? suffixCurrency ?? 'KZT' };
 }
 
@@ -58,6 +58,40 @@ export function parseIncome(text, force = false, context = '') {
   const sourceName = description || context.match(incomeSource)?.[0] || 'Поступление';
   const title = /^з\/?п$/iu.test(sourceName) ? 'Зарплата' : sourceName;
   return { kind: 'income', inflow: { ...amount, title: title.slice(0, 160) } };
+}
+
+const totalBalance = /^(?:у нас\s+)?(?:сейчас\s+(?:всего|денег)|всего(?:\s+(?:денег|на руках))?|(?:общий\s+)?баланс(?:\s+сейчас)?)(?!\p{L})\s*[:—–=]?\s*/iu;
+const fundBalance = /(?<!\p{L})(?:отложено|накоплено)(?!\p{L})/iu;
+
+export function parseBalances(text) {
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  const hasTotal = lines.some(line => totalBalance.test(line));
+  const recognized = lines.map(line => {
+    const total = totalBalance.exec(line);
+    if (total) return { total: true, rest: line.slice(total[0].length) };
+    const fund = fundBalance.exec(line);
+    if (fund) return { total: false, rest: line.replace(fund[0], ' ') };
+    if (hasTotal && /^на\s+\p{L}/iu.test(line)) return { total: false, rest: line };
+    return null;
+  });
+  if (!recognized.some(Boolean)) return null;
+  const pending = { kind: 'pending', flow: 'balances' };
+  if (/[?]/u.test(text) || recognized.some(line => !line)) return pending;
+  const balances = [];
+  const seen = new Set();
+  for (const { total, rest } of recognized) {
+    const [raw, extra] = sourceAmounts(rest);
+    const amount = raw && !extra && parseAmount(raw, true);
+    if (!amount || amount.currency !== 'KZT') return pending;
+    if (total && /\p{L}/u.test(rest.replace(raw, '').replace(/(?:на руках|денег)/giu, ''))) return pending;
+    const title = total ? 'Всего денег' : rest.replace(raw, ' ').replace(/^[\s:—–=-]+|[\s:—–.=-]+$/gu, '').replace(/^(?:(?:из них|в том числе)\s+)?(?:на\s+)?/iu, '').replace(/\s+/gu, ' ').trim();
+    if (!/\p{L}/u.test(title) || title.length > 80) return pending;
+    const name = total ? 'total' : `fund:${title.toLowerCase()}`;
+    if (seen.has(name)) return pending;
+    seen.add(name);
+    balances.push({ ...amount, name, title });
+  }
+  return { kind: 'balances', balances };
 }
 
 function parseLine(line, force) {
@@ -238,34 +272,87 @@ function incomeTotals(records) {
   return totals;
 }
 
+export function currentBalances(state) {
+  const records = Object.values(state.records);
+  const latest = new Map();
+  for (const record of records) {
+    for (const value of record.balances ?? []) {
+      const prior = latest.get(value.name);
+      if (!prior || record.at > prior.at || (record.at === prior.at && record.id > prior.id)) {
+        latest.set(value.name, { ...value, at: record.at, id: record.id });
+      }
+    }
+  }
+  const snapshot = latest.get('total');
+  let total;
+  if (snapshot) {
+    let minor = snapshot.minor;
+    for (const record of records) {
+      if (record.at < snapshot.at || (record.at === snapshot.at && record.id <= snapshot.id)) continue;
+      if (record.inflow?.currency === 'KZT') minor += record.inflow.minor;
+      for (const item of record.items ?? []) if (item.currency === 'KZT') minor -= item.minor;
+    }
+    total = { ...snapshot, minor };
+  }
+  const funds = [...latest.values()].filter(row => row.name !== 'total' && row.minor > 0);
+  const earmarked = funds.reduce((sum, row) => sum + row.minor, 0);
+  return { total, funds, earmarked, free: total ? total.minor - earmarked : undefined };
+}
+
+export function balancesOverview(state) {
+  const { total, funds, earmarked, free } = currentBalances(state);
+  if (!total && !funds.length) return 'Запишите общий остаток и суммы по целям, например «сейчас всего 450000» и «отложено на отпуск 150000».';
+  const lines = ['Деньги и накопления'];
+  if (total) lines.push(`Всего денег — ${money(total.minor, 'KZT')}.`);
+  if (funds.length) {
+    lines.push(`Отложено по целям — ${money(earmarked, 'KZT')}.`);
+    for (const { title, minor } of funds) lines.push(`• ${title} — ${money(minor, 'KZT')}`);
+  }
+  if (total) {
+    if (free >= 0) lines.push(`Свободно — ${money(free, 'KZT')}.`);
+    else lines.push(`По целям указано на ${money(-free, 'KZT')} больше общего остатка. Обновите суммы.`);
+  } else lines.push('Напишите «сейчас всего …», чтобы я посчитал свободный остаток.');
+  return lines.join('\n');
+}
+
 export function savingsOverview(state, period, timezone) {
   const records = entriesFor(state, period, timezone);
   const incomes = incomeTotals(records);
-  if (!incomes.size) return 'Добавьте поступление за этот месяц, например «зп 350 000 ₸» или /income 350000 зарплата. Тогда я смогу оценить, сколько отложить.';
   const spend = groupByCurrency(records.flatMap(record => record.items ?? []));
   const plan = monthlyBudget(state, period, timezone);
+  const { total, funds, free } = currentBalances(state);
+  if (!incomes.size && !total && !funds.length) return 'Добавьте поступление за этот месяц, например «зп 350 000 ₸», или укажите текущий остаток: «сейчас всего 450000».';
   const lines = [`Сколько можно отложить за ${period}`];
-  for (const [code, income] of incomes) {
+  const currencies = new Set(incomes.keys());
+  if (total) currencies.add('KZT');
+  if (total || funds.length) lines.push(balancesOverview(state), '');
+  for (const code of currencies) {
+    const income = incomes.get(code);
     const spent = spend.get(code)?.total ?? 0;
-    const balance = income - spent;
-    lines.push(`Поступило ${money(income, code)} · потрачено ${money(spent, code)}.`);
-    lines.push(`${balance < 0 ? 'По записям расходы выше поступлений на' : 'Остаток по записям'} ${money(Math.abs(balance), code)}.`);
+    if (income !== undefined) {
+      const balance = income - spent;
+      lines.push(`Поступило ${money(income, code)} · потрачено ${money(spent, code)}.`);
+      lines.push(`${balance < 0 ? 'По записям расходы выше поступлений на' : 'Остаток по записям'} ${money(Math.abs(balance), code)}.`);
+    }
     const budget = plan.totals.find(row => row.currency === code);
     if (!budget) {
       lines.push('Задайте месячный лимит через /budget, чтобы учесть предстоящие расходы.');
       continue;
     }
     const reserved = Math.max(0, budget.minor - spent);
-    const available = Math.max(0, balance - reserved);
+    const fromIncome = income === undefined ? Infinity : Math.max(0, income - spent - reserved);
+    const fromCash = code === 'KZT' && total ? Math.max(0, free - reserved) : Infinity;
+    const available = Math.min(fromIncome, fromCash);
     if (reserved) lines.push(`На оставшиеся расходы по ${budget.automatic ? 'ориентиру' : 'лимиту'} оставьте ${money(reserved, code)}.`);
     if (spent > budget.minor) lines.push('Лимит расходов уже превышен. Учтите оставшиеся платежи, если они ещё предстоят.');
-    lines.push(`Можно отложить до ${money(available, code)} по записанным поступлениям и расходам.`);
+    const basis = total && code === 'KZT' ? 'с учётом свободного остатка' : 'по записанным поступлениям и расходам';
+    lines.push(`Можно отложить до ${money(available, code)} ${basis}.`);
     if (state.goal?.currency === code) {
       const target = Math.ceil(state.goal.minor / state.goal.months);
       lines.push(`План по цели — ${money(target, code)} в месяц. ${available >= target ? 'Этот взнос помещается в расчёт.' : `До полного взноса по плану не хватает ${money(target - available, code)}.`}`);
     }
   }
-  lines.push('Если уже отложили деньги или ожидаются платежи сверх бюджета, вычтите их из доступной суммы.');
+  lines.push(total ? 'Если были операции вне чата, сверяйте общий остаток. Учтите платежи сверх бюджета.' : 'Если уже отложили деньги или ожидаются платежи сверх бюджета, вычтите их из доступной суммы.');
   return lines.join('\n');
 }
 

@@ -2,13 +2,14 @@ import { mkdir, readFile, rename, rmdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { advice, budgetForExpense, budgetOverview, categoryNames, comment, findCategory, money, monthAt, parseAmount, parseExpense, parseIncome, savingsOverview, summarize } from './ledger.mjs';
+import { advice, balancesOverview, budgetForExpense, budgetOverview, categoryNames, comment, findCategory, money, monthAt, parseAmount, parseBalances, parseExpense, parseIncome, savingsOverview, summarize } from './ledger.mjs';
 import { GeminiError, makeGemini } from './gemini.mjs';
 
 const menuRows = [
   [['Этот месяц', '/total'], ['Вся история', '/total all']],
   [['Бюджет', '/budget'], ['Сколько отложить', '/savings']],
   [['Советы', '/advice'], ['Уточнить записи', '/review']],
+  [['Накопления', '/funds']],
 ];
 const menuCommands = new Map(menuRows.flat().map(([label, command]) => [label.toLowerCase(), command]));
 export const menuText = 'Кнопки «Финансового управляющего» под полем ввода. Траты и поступления можно писать обычными сообщениями.';
@@ -31,6 +32,8 @@ const instructions = `Финансовый управляющий
 /budget Транспорт | 25000 — задать месячный лимит категории
 /income 350000 зарплата — записать поступление. Можно просто написать «зп 350 000 ₸».
 /savings — сколько можно отложить в этом месяце
+/funds — текущие деньги и накопления по целям
+«сейчас всего 450000» и «отложено на отпуск 150000» — обновить суммы
 /goal 120000 12 — задать сумму и срок накопления в месяцах
 /review — расходы, которые ждут уточнения
 /add кофе 250 — записать расход явно
@@ -132,6 +135,7 @@ function put(state, key, at, parsed, text) {
   }
   if (parsed.kind === 'expense') record.items = parsed.items;
   if (parsed.kind === 'income') record.inflow = parsed.inflow;
+  if (parsed.kind === 'balances') record.balances = parsed.balances;
   state.records[key] = record;
   if (record.kind !== 'pending') {
     for (const [prompt, target] of Object.entries(state.prompts)) {
@@ -146,6 +150,10 @@ function amountOnly(text) {
   return amount ? { kind: 'expense', items: [{ ...amount, category: 'Без назначения', title: 'Назначение не указано' }] } : null;
 }
 
+function localEntry(text) {
+  return parseBalances(text) ?? parseIncome(text) ?? amountOnly(text);
+}
+
 function classifyLocally(text, clarification) {
   if (!clarification) return amountOnly(text) ?? parseExpense(text);
   return parseAmount(clarification) ? parseExpense(`${text} ${clarification}`) : parseExpense(clarification, true);
@@ -153,10 +161,8 @@ function classifyLocally(text, clarification) {
 
 async function classify(text, config, clarification) {
   if (!clarification) {
-    const income = parseIncome(text);
-    if (income) return income;
-    const standalone = amountOnly(text);
-    if (standalone) return standalone;
+    const known = localEntry(text);
+    if (known) return known;
   }
   if (!config.gemini) return classifyLocally(text, clarification);
   try {
@@ -176,6 +182,7 @@ function needsCategory(record) {
 }
 
 function responseFor(parsed, record, key, state, period, timezone) {
+  if (parsed.kind === 'balances') return { text: `Обновил остатки. #${record.id}\n\n${savingsOverview(state, period, timezone)}` };
   if (parsed.kind === 'income') {
     const { minor, currency, title } = record.inflow;
     const lines = [`Записал поступление ${money(minor, currency)} · ${title}\n#${record.id}`];
@@ -188,6 +195,7 @@ function responseFor(parsed, record, key, state, period, timezone) {
     return { text: lines.join('\n'), prompt: needsCategory(record) ? key : undefined };
   }
   if (parsed.kind === 'pending' && !parsed.quiet) {
+    if (parsed.flow === 'balances') return { text: `Укажите одну сумму на строку. Например, «сейчас всего 450000» или «отложено на отпуск 150000».\n#${record.id}`, prompt: key };
     if (parsed.flow === 'income') return { text: `Сколько поступило? Ответьте, например, «350 000 ₸ зарплата».\n#${record.id}`, prompt: key };
     return { text: `${parsed.note || `${question} ${record.id}.`}\n#${record.id}`, prompt: key };
   }
@@ -221,6 +229,7 @@ export async function handleUpdate(state, config, update, bot) {
       case 'start': case 'help': return say(instructions);
       case 'menu': return say(menuText);
       case 'categories': return say(categoryNames);
+      case 'funds': return say(balancesOverview(state));
       case 'savings': return say(savingsOverview(state, period, config.timezone));
       case 'total': {
         const selected = argument.toLowerCase() || period;
@@ -293,11 +302,13 @@ export async function handleUpdate(state, config, update, bot) {
           return say(`Запись #${id} исключена из итогов.`);
         }
         const correctingIncome = previous.kind === 'income' || previous.flow === 'income';
-        const parsed = correctingIncome
+        const correctingBalances = previous.kind === 'balances' || previous.flow === 'balances';
+        const parsed = parseBalances(correction ?? '') ?? (correctingBalances ? { kind: 'pending' } : correctingIncome
           ? parseIncome(correction ?? '', true, previous.inflow?.title ?? previous.text)
-          : parseIncome(correction ?? '') ?? parseExpense(correction ?? '', true);
-        if (!['expense', 'income'].includes(parsed.kind)) {
-          return say(`Формат исправления — /fix ${id} ${correctingIncome ? '350000 зарплата' : 'такси 2500 ₸'}.`);
+          : parseIncome(correction ?? '') ?? parseExpense(correction ?? '', true));
+        if (!['expense', 'income', 'balances'].includes(parsed.kind)) {
+          const example = correctingBalances ? 'отложено на отпуск 150000' : correctingIncome ? '350000 зарплата' : 'такси 2500 ₸';
+          return say(`Формат исправления — /fix ${id} ${example}.`);
         }
         const record = put(state, target, previous.at, parsed, correction);
         const reply = expenseReply(parsed, record, target);
@@ -326,6 +337,9 @@ export async function handleUpdate(state, config, update, bot) {
           return { text: `Укажите назначение без суммы, например «такси», или название категории из /categories. Для исправления суммы — /fix ${referred.id}.`, prompt: referencedKey };
         }
       }
+    } else if (referred.flow === 'balances') {
+      const completed = parseAmount(text, true) ? parseBalances(`${referred.text} ${text}`) : null;
+      parsed = parseBalances(text) ?? completed ?? { kind: 'pending', flow: 'balances' };
     } else if (referred.flow === 'income') {
       parsed = parseIncome(text, true, referred.text);
     } else {
@@ -350,12 +364,14 @@ export async function handleUpdate(state, config, update, bot) {
     return;
   }
   if (text.startsWith('/')) return;
-  const parsed = previous?.kind === 'income' && parseAmount(text)
-    ? parseIncome(text, true, previous.inflow.title)
-    : await classify(text, config);
+  const replacement = previous?.kind === 'balances' && previous.balances.length === 1 ? parseAmount(text, true) : null;
+  let parsed;
+  if (replacement?.currency === 'KZT') parsed = { kind: 'balances', balances: [{ ...previous.balances[0], ...replacement }] };
+  else if (previous?.kind === 'income' && parseAmount(text)) parsed = parseIncome(text, true, previous.inflow.title);
+  else parsed = await classify(text, config);
   if (parsed.kind === 'ignore' && !previous) return;
   const record = put(state, key, at, parsed, text);
-  if (parsed.kind === 'ignore' && ['expense', 'income'].includes(previous.kind)) return say(`После правки запись #${record.id} исключена из итогов.`);
+  if (parsed.kind === 'ignore' && ['expense', 'income', 'balances'].includes(previous.kind)) return say(`После правки запись #${record.id} исключена из итогов.`);
   return expenseReply(parsed, record, key);
 }
 
@@ -376,14 +392,20 @@ export async function importHistory(state, config, file, until, onBatch = async 
   let lastGeminiRequest = 0;
   const commit = async () => {
     if (!queued.length) return;
-    if (config.gemini) {
+    const local = queued.map(row => localEntry(row.text));
+    const remaining = queued.filter((_, index) => !local[index]);
+    let classified = [];
+    if (config.gemini && remaining.length) {
       const delay = 7_000 - (Date.now() - lastGeminiRequest);
       if (delay > 0) await sleep(delay);
       lastGeminiRequest = Date.now();
+      classified = await config.gemini.classify(remaining);
+    } else {
+      classified = remaining.map(row => parseExpense(row.text));
     }
-    const results = config.gemini ? await config.gemini.classify(queued) : queued.map(row => parseExpense(row.text));
+    let next = 0;
     for (const [index, row] of queued.entries()) {
-      const parsed = amountOnly(row.text) ?? results[index];
+      const parsed = local[index] ?? classified[next++];
       put(state, row.key, row.at, parsed, row.text);
       if (parsed.kind === 'expense') counts.expenses += parsed.items.length;
       if (parsed.kind === 'pending') counts.pending++;
