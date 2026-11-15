@@ -4,6 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { advice, balancesOverview, budgetForExpense, budgetOverview, categoryNames, comment, findCategory, money, monthAt, parseAmount, parseBalances, parseExpense, parseIncome, savingsOverview, summarize } from './ledger.mjs';
 import { GeminiError, makeGemini } from './gemini.mjs';
+import { downloadScreenshot, ScreenshotError, screenshotAttachment, screenshotDraft, screenshotPreview } from './screenshot.mjs';
 
 const menuRows = [
   [['Этот месяц', '/total'], ['Вся история', '/total all']],
@@ -34,6 +35,7 @@ const instructions = `Финансовый управляющий
 /savings — сколько можно отложить в этом месяце
 /funds — текущие деньги и накопления по целям
 «сейчас всего 450000» и «отложено на отпуск 150000» — обновить суммы
+Фото чека или скриншот с подписью «скрин» — распознать и проверить перед записью
 /goal 120000 12 — задать сумму и срок накопления в месяцах
 /review — расходы, которые ждут уточнения
 /add кофе 250 — записать расход явно
@@ -132,6 +134,7 @@ function put(state, key, at, parsed, text) {
   if (parsed.kind === 'pending') {
     record.text = text;
     if (parsed.flow) record.flow = parsed.flow;
+    if (parsed.draft) record.draft = parsed.draft;
   }
   if (parsed.kind === 'expense') record.items = parsed.items;
   if (parsed.kind === 'income') record.inflow = parsed.inflow;
@@ -195,6 +198,7 @@ function responseFor(parsed, record, key, state, period, timezone) {
     return { text: lines.join('\n'), prompt: needsCategory(record) ? key : undefined };
   }
   if (parsed.kind === 'pending' && !parsed.quiet) {
+    if (parsed.flow === 'image') return { text: `${screenshotPreview(parsed.draft)}\n\nОтветьте «да», чтобы записать, или «нет», чтобы отменить.\n#${record.id}`, prompt: key };
     if (parsed.flow === 'balances') return { text: `Укажите одну сумму на строку. Например, «сейчас всего 450000» или «отложено на отпуск 150000».\n#${record.id}`, prompt: key };
     if (parsed.flow === 'income') return { text: `Сколько поступило? Ответьте, например, «350 000 ₸ зарплата».\n#${record.id}`, prompt: key };
     return { text: `${parsed.note || `${question} ${record.id}.`}\n#${record.id}`, prompt: key };
@@ -337,6 +341,15 @@ export async function handleUpdate(state, config, update, bot) {
           return { text: `Укажите назначение без суммы, например «такси», или название категории из /categories. Для исправления суммы — /fix ${referred.id}.`, prompt: referencedKey };
         }
       }
+    } else if (referred.flow === 'image') {
+      if (/^(?:да|верно|подтверждаю|запиши)[.!]?$/iu.test(text)) parsed = referred.draft;
+      else if (/^(?:нет|отмена|отмени)[.!]?$/iu.test(text)) parsed = { kind: 'ignore' };
+      else {
+        parsed = parseBalances(text) ?? parseIncome(text) ?? (referred.draft.kind === 'expense' ? parseExpense(text, true) : null);
+        if (!parsed || !['expense', 'income', 'balances'].includes(parsed.kind)) {
+          return { text: 'Ответьте «да» или «нет». Для исправления можно ввести запись целиком, например «такси 2500» или «сейчас всего 450000».', prompt: referencedKey };
+        }
+      }
     } else if (referred.flow === 'balances') {
       const completed = parseAmount(text, true) ? parseBalances(`${referred.text} ${text}`) : null;
       parsed = parseBalances(text) ?? completed ?? { kind: 'pending', flow: 'balances' };
@@ -356,6 +369,23 @@ export async function handleUpdate(state, config, update, bot) {
   }
   const previous = state.records[key];
   if (previous && !update.edited_message) return;
+  const attachment = screenshotAttachment(message, text);
+  if (attachment && update.edited_message) return;
+  if (attachment) {
+    if (!config.readScreenshot) return say('Чтение изображений требует настроенного Gemini. Пока сумму можно указать в подписи.');
+    let draft;
+    try {
+      draft = await config.readScreenshot(attachment, text);
+    } catch (error) {
+      if (error instanceof ScreenshotError) return say(error.message);
+      console.error(error instanceof GeminiError ? error.message : 'Чтение изображения не удалось.');
+      return say('Сейчас прочитать изображение не получилось. Отправьте скриншот ещё раз или напишите сумму в подписи.');
+    }
+    if (!draft) return say('Не удалось однозначно прочитать сумму. Пришлите фрагмент с одной операцией или укажите сумму в подписи.');
+    const parsed = { kind: 'pending', flow: 'image', draft };
+    const record = put(state, key, at, parsed, `Скриншот · ${screenshotPreview(draft)}`);
+    return expenseReply(parsed, record, key);
+  }
   if (!text) {
     if (previous && previous.kind !== 'ignore') {
       put(state, key, at, { kind: 'ignore' }, '');
@@ -499,6 +529,10 @@ async function flush(state, config, tg) {
 }
 
 async function run(state, config, tg) {
+  if (config.gemini) config.readScreenshot = async (attachment, caption) => {
+    const image = await downloadScreenshot(config.telegramToken, attachment, tg);
+    return screenshotDraft(await config.gemini.readScreenshot(image, caption));
+  };
   const bot = await tg('getMe', {});
   if (!bot.can_read_all_group_messages) console.log('Для обычных сообщений отключите Group Privacy в BotFather и заново добавьте бота в группу, либо добавьте его как администратора.');
   const webhook = await tg('getWebhookInfo', {});
